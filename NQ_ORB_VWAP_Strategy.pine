@@ -1,0 +1,184 @@
+//@version=6
+// =============================================================================
+//  NQ1! Opening Range Breakout + VWAP filter  (5-minute chart)
+//  - Builds the opening range (OR) from the first minutes of the NY session
+//  - Enters on the first confirmed close beyond the OR, in the direction of
+//    the RTH-anchored VWAP (optional EMA trend filter)
+//  - Stop = ATR-based or recent swing high/low, Target = R:R multiple of risk
+//  - Flat before the session ends; one position at a time
+// =============================================================================
+strategy(title                   = "NQ ORB + VWAP Strategy",
+         shorttitle              = "NQ ORB",
+         overlay                 = true,
+         pyramiding              = 0,                                   // one position at a time
+         default_qty_type        = strategy.fixed,
+         default_qty_value       = 1,                                   // 1 contract
+         initial_capital         = 100000,
+         currency                = currency.USD,
+         commission_type         = strategy.commission.cash_per_contract,
+         commission_value        = 2.5,                                 // $ per contract per side (~$5 round turn)
+         slippage                = 2,                                   // ticks per fill (2 ticks = 0.50 pt = $10 on NQ)
+         margin_long             = 10,                                  // keeps the 1-lot from being margin-called on a $100k account
+         margin_short            = 10,
+         calc_on_every_tick      = false,                               // evaluate on bar close only
+         process_orders_on_close = false,                               // fill at next bar open (no lookahead)
+         max_lines_count         = 500,
+         max_labels_count        = 500)
+
+// ───────────────────────────── INPUTS ─────────────────────────────
+const string G_SESS = "Session (America/New_York)"
+sessTZ      = input.string("America/New_York", "Time zone",                          group = G_SESS)
+rthSess     = input.session("0930-1600",       "Regular trading hours",              group = G_SESS)
+orSess      = input.session("0930-0945",       "Opening range window",               group = G_SESS, tooltip = "Default 15 minutes = first three 5m bars")
+entrySess   = input.session("0945-1530",       "Entry window",                       group = G_SESS, tooltip = "New entries are only allowed on bars that open inside this window")
+flatSess    = input.session("1550-1600",       "Flatten window",                     group = G_SESS, tooltip = "Any open position is closed at the close of the first bar in this window (fills on next bar open, before 16:00)")
+
+const string G_DIR = "Direction"
+allowLong   = input.bool(true,  "Enable longs",                                      group = G_DIR)
+allowShort  = input.bool(true,  "Enable shorts",                                     group = G_DIR)
+maxTrades   = input.int(2,      "Max trades per day", minval = 1,                    group = G_DIR)
+
+const string G_FILT = "Filters"
+useVwap     = input.bool(true,  "Require price on correct side of RTH VWAP",         group = G_FILT)
+useEma      = input.bool(false, "Require price on correct side of EMA",              group = G_FILT)
+emaLen      = input.int(50,     "EMA length", minval = 1,                            group = G_FILT)
+atrLen      = input.int(14,     "ATR length", minval = 1,                            group = G_FILT)
+orMinAtr    = input.float(0.5,  "Min OR width (x ATR)", minval = 0.0, step = 0.1,    group = G_FILT, tooltip = "Skip the day if the opening range is too narrow (chop)")
+orMaxAtr    = input.float(4.0,  "Max OR width (x ATR)", minval = 0.1, step = 0.1,    group = G_FILT, tooltip = "Skip the day if the opening range is too wide (move already done / stop too large)")
+
+const string G_RISK = "Stop loss / Take profit"
+stopType    = input.string("ATR", "Stop type", options = ["ATR", "Swing"],           group = G_RISK)
+atrMult     = input.float(1.5,  "ATR stop multiplier", minval = 0.1, step = 0.1,     group = G_RISK)
+swingLen    = input.int(5,      "Swing lookback (bars)", minval = 1,                 group = G_RISK)
+swingBufTk  = input.int(4,      "Swing stop buffer (ticks)", minval = 0,             group = G_RISK)
+minStopTk   = input.int(20,     "Minimum stop distance (ticks)", minval = 1,         group = G_RISK, tooltip = "20 ticks = 5 NQ points")
+rr          = input.float(2.0,  "Risk : Reward (TP = R x stop)", minval = 0.1, step = 0.1, group = G_RISK)
+
+const string G_VIS = "Visuals"
+showOR      = input.bool(true,  "Show opening range",                                group = G_VIS)
+showVwap    = input.bool(true,  "Show RTH VWAP",                                     group = G_VIS)
+showEma     = input.bool(false, "Show EMA",                                          group = G_VIS)
+
+// ───────────────────────────── SESSION STATE ─────────────────────────────
+// time() returns na when the bar is outside the session string → boolean flags
+bool inRth    = not na(time(timeframe.period, rthSess,   sessTZ))
+bool inOR     = not na(time(timeframe.period, orSess,    sessTZ))
+bool inEntry  = not na(time(timeframe.period, entrySess, sessTZ))
+bool inFlat   = not na(time(timeframe.period, flatSess,  sessTZ))
+bool rthStart = inRth and not inRth[1]
+bool orStart  = inOR  and not inOR[1]
+
+// ───────────────────────────── INDICATORS ─────────────────────────────
+float atr    = ta.atr(atrLen)
+float ema    = ta.ema(close, emaLen)
+// VWAP anchored to the 9:30 NY open (the built-in ta.vwap anchors to the 18:00 futures session open)
+float rthVwap = ta.vwap(hlc3, rthStart)
+
+// ───────────────────────────── OPENING RANGE ─────────────────────────────
+var float orHigh = na
+var float orLow  = na
+var int   tradesToday = 0
+
+if orStart
+    orHigh      := high
+    orLow       := low
+    tradesToday := 0
+else if inOR
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow,  low)
+
+bool  orReady = inRth and not inOR and not na(orHigh)
+float orWidth = orHigh - orLow
+bool  orOk    = orReady and orWidth >= orMinAtr * atr and orWidth <= orMaxAtr * atr
+
+// ───────────────────────────── SIGNALS (confirmed bars only) ─────────────────────────────
+bool flat     = strategy.position_size == 0
+bool canTrade = barstate.isconfirmed and inEntry and orOk and flat and tradesToday < maxTrades
+
+// First close beyond the OR (close[1] was still inside / at the level)
+bool longBreak  = close > orHigh and close[1] <= orHigh
+bool shortBreak = close < orLow  and close[1] >= orLow
+
+bool longFilt  = (not useVwap or close > rthVwap) and (not useEma or close > ema)
+bool shortFilt = (not useVwap or close < rthVwap) and (not useEma or close < ema)
+
+bool longSignal  = canTrade and allowLong  and longBreak  and longFilt
+bool shortSignal = canTrade and allowShort and shortBreak and shortFilt
+
+// ───────────────────────────── STOP / TARGET CALC ─────────────────────────────
+float tick    = syminfo.mintick
+float minStop = minStopTk * tick
+
+// Swing extremes computed on every bar (keeps ta.* calls out of conditional scope)
+float swingLow  = ta.lowest(low,  swingLen)
+float swingHigh = ta.highest(high, swingLen)
+
+// Risk distance (points) from the signal close, floored at the minimum stop
+float longRisk  = math.max(stopType == "ATR" ? atr * atrMult : close - (swingLow  - swingBufTk * tick), minStop)
+float shortRisk = math.max(stopType == "ATR" ? atr * atrMult : (swingHigh + swingBufTk * tick) - close, minStop)
+
+// Levels of the pending / active trade
+var float tradeSL    = na
+var float tradeTP    = na
+var float tradeEntry = na
+
+// ───────────────────────────── ORDERS ─────────────────────────────
+if longSignal
+    tradeEntry := close
+    tradeSL    := math.round_to_mintick(close - longRisk)
+    tradeTP    := math.round_to_mintick(close + longRisk * rr)
+    tradesToday += 1
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", from_entry = "Long", stop = tradeSL, limit = tradeTP)
+    alert("NQ ORB LONG | Entry ≈ " + str.tostring(close, format.mintick) + " | SL " + str.tostring(tradeSL, format.mintick) + " | TP " + str.tostring(tradeTP, format.mintick), alert.freq_once_per_bar_close)
+
+if shortSignal
+    tradeEntry := close
+    tradeSL    := math.round_to_mintick(close + shortRisk)
+    tradeTP    := math.round_to_mintick(close - shortRisk * rr)
+    tradesToday += 1
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", from_entry = "Short", stop = tradeSL, limit = tradeTP)
+    alert("NQ ORB SHORT | Entry ≈ " + str.tostring(close, format.mintick) + " | SL " + str.tostring(tradeSL, format.mintick) + " | TP " + str.tostring(tradeTP, format.mintick), alert.freq_once_per_bar_close)
+
+// End-of-day flatten: inside the flatten window, or (safety net) if we somehow hold outside RTH
+if strategy.position_size != 0 and (inFlat or not inRth)
+    strategy.close_all(comment = "EOD Flat")
+    alert("NQ ORB: flattening open position before session close", alert.freq_once_per_bar_close)
+
+// ───────────────────────────── CHART: ENTRY MARKERS ─────────────────────────────
+plotshape(longSignal,  title = "Long signal",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.lime, 0), size = size.small, text = "LONG",  textcolor = color.lime)
+plotshape(shortSignal, title = "Short signal", style = shape.triangledown, location = location.abovebar, color = color.new(color.red,  0), size = size.small, text = "SHORT", textcolor = color.red)
+
+// ───────────────────────────── CHART: SL / TP LINES OF ACTIVE TRADE ─────────────────────────────
+var line  slLine = na
+var line  tpLine = na
+var line  enLine = na
+var label slLbl  = na
+var label tpLbl  = na
+
+// A new trade opened on this bar (also catches trades that open and close within one bar)
+int  tradeCount = strategy.opentrades + strategy.closedtrades
+bool newTrade   = tradeCount > nz(tradeCount[1])
+
+if newTrade and not na(tradeSL)
+    slLine := line.new(bar_index, tradeSL,    bar_index, tradeSL,    color = color.red,   width = 2)
+    tpLine := line.new(bar_index, tradeTP,    bar_index, tradeTP,    color = color.green, width = 2)
+    enLine := line.new(bar_index, tradeEntry, bar_index, tradeEntry, color = color.gray,  style = line.style_dashed)
+    slLbl  := label.new(bar_index, tradeSL, "SL " + str.tostring(tradeSL, format.mintick), style = label.style_label_left, color = color.red,   textcolor = color.white, size = size.small)
+    tpLbl  := label.new(bar_index, tradeTP, "TP " + str.tostring(tradeTP, format.mintick), style = label.style_label_left, color = color.green, textcolor = color.white, size = size.small)
+
+// Extend lines / move labels while the trade is open
+if strategy.position_size != 0 and not na(slLine)
+    line.set_x2(slLine, bar_index)
+    line.set_x2(tpLine, bar_index)
+    line.set_x2(enLine, bar_index)
+    label.set_x(slLbl,  bar_index)
+    label.set_x(tpLbl,  bar_index)
+
+// ───────────────────────────── CHART: CONTEXT ─────────────────────────────
+plot(showOR and orReady ? orHigh : na, "OR High", color = color.new(color.aqua, 0),    style = plot.style_linebr, linewidth = 1)
+plot(showOR and orReady ? orLow  : na, "OR Low",  color = color.new(color.orange, 0),  style = plot.style_linebr, linewidth = 1)
+plot(showVwap and inRth ? rthVwap : na, "RTH VWAP", color = color.new(color.purple, 0), style = plot.style_linebr, linewidth = 2)
+plot(showEma ? ema : na, "EMA", color = color.new(color.yellow, 0))
+bgcolor(showOR and inOR ? color.new(color.blue, 90) : na, title = "Opening range window")
