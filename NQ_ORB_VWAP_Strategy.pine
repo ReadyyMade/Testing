@@ -1,16 +1,22 @@
 //@version=6
 // =============================================================================
-//  NQ1! Opening Range Breakout + VWAP filter  (5-minute chart)
-//  - Builds the opening range (OR) from the first minutes of the NY session
-//  - Enters on the first confirmed close beyond the OR, in the direction of
-//    the RTH-anchored VWAP (optional EMA trend filter)
-//  - Stop = ATR-based or recent swing high/low, Target = R:R multiple of risk
-//  - SL/TP re-anchored to the real fill, optional breakeven, stop after a winner
-//  - Flat before the session ends; one position at a time
-//  - Status dashboard in the chart corner
+//  NQ1! AM / PM Range Breakout + VWAP filter   (5-minute chart, Brasília time)
+//
+//  Trades NQ's two daily volume peaks, one breakout in each:
+//   - AM: breakout of the New York opening range (heaviest volume of the day)
+//   - PM: breakout of the quiet lunch range when volume returns into the close
+//
+//  All schedule inputs are in Brasília time (BRT). The US changes its clocks
+//  and Brazil doesn't, so by default the windows follow New York's daylight
+//  saving and always line up with the real NY session
+//  (NY open = 10:30 BRT from March to November, 11:30 BRT from November to March).
+//
+//  Filters: RTH VWAP side, optional EMA, range width vs ATR, breakout volume.
+//  Stop = ATR or swing, target = per-window R:R re-anchored to the real fill,
+//  optional breakeven, flat before the close, one position at a time.
 // =============================================================================
-strategy(title                   = "NQ ORB + VWAP Strategy",
-         shorttitle              = "NQ ORB",
+strategy(title                   = "NQ AM/PM Range Breakout (BRT)",
+         shorttitle              = "NQ AM/PM",
          overlay                 = true,
          pyramiding              = 0,                                   // one position at a time
          default_qty_type        = strategy.fixed,
@@ -29,47 +35,66 @@ strategy(title                   = "NQ ORB + VWAP Strategy",
          max_boxes_count         = 500)
 
 // ───────────────────────────── INPUTS ─────────────────────────────
-const string G_SESS = "Session (America/New_York)"
-sessTZ      = input.string("America/New_York", "Time zone",                          group = G_SESS)
-rthSess     = input.session("0930-1600",       "Regular trading hours",              group = G_SESS)
-orSess      = input.session("0930-0945",       "Opening range window",               group = G_SESS, tooltip = "Default 15 minutes = first three 5m bars")
-entrySess   = input.session("0945-1530",       "Entry window",                       group = G_SESS, tooltip = "New entries are only allowed on bars that open inside this window")
-flatSess    = input.session("1550-1600",       "Flatten window",                     group = G_SESS, tooltip = "Any open position is closed at the close of the first bar in this window (fills on next bar open, before 16:00)")
+const string G_SCHED  = "Schedule (Brasília time, BRT)"
+const string T_FOLLOW = "The US changes clocks in March and November, Brazil doesn't. ON: type the times as they are while New York is on summer time (NY open = 10:30 BRT). From November to March every window then moves +1h on its own (NY open = 11:30 BRT), so every backtest date lines up with the real NY session. OFF: the times are used exactly as typed, all year."
+followNY  = input.bool(true, "Follow New York daylight saving (recommended)", group = G_SCHED, tooltip = T_FOLLOW)
+rthSess   = input.session("1030-1700", "NY regular hours", group = G_SCHED, tooltip = "09:30–16:00 New York")
+flatSess  = input.session("1650-1700", "Flatten window",   group = G_SCHED, tooltip = "Any open position is closed at the close of the first bar in this window (fills on the next bar's open, before the NY close)")
+
+const string G_AM = "AM window: opening range breakout"
+amOn      = input.bool(true, "Trade the AM window", group = G_AM)
+amRngSess = input.session("1030-1045", "Opening range", group = G_AM, tooltip = "09:30–09:45 New York (first three 5m bars)")
+amEntSess = input.session("1045-1200", "Entries",       group = G_AM, tooltip = "09:45–11:00 New York")
+amMax     = input.int(1, "Max trades", minval = 1,                             group = G_AM, inline = "am1")
+amRR      = input.float(2.0, "R:R", minval = 0.1, step = 0.1,                  group = G_AM, inline = "am1")
+amMinAtr  = input.float(0.5, "Range width (x ATR) min", minval = 0.0, step = 0.1, group = G_AM, inline = "am2")
+amMaxAtr  = input.float(4.0, "max", minval = 0.1, step = 0.1,                  group = G_AM, inline = "am2")
+
+const string G_PM = "PM window: lunch range breakout"
+pmOn      = input.bool(true, "Trade the PM window", group = G_PM)
+pmRngSess = input.session("1300-1500", "Lunch range", group = G_PM, tooltip = "12:00–14:00 New York")
+pmEntSess = input.session("1500-1615", "Entries",     group = G_PM, tooltip = "14:00–15:15 New York")
+pmMax     = input.int(1, "Max trades", minval = 1,                             group = G_PM, inline = "pm1")
+pmRR      = input.float(1.5, "R:R", minval = 0.1, step = 0.1,                  group = G_PM, inline = "pm1")
+pmMinAtr  = input.float(1.5, "Range width (x ATR) min", minval = 0.0, step = 0.1, group = G_PM, inline = "pm2")
+pmMaxAtr  = input.float(8.0, "max", minval = 0.1, step = 0.1,                  group = G_PM, inline = "pm2")
 
 const string G_DIR = "Direction"
-allowLong    = input.bool(true,  "Enable longs",                                     group = G_DIR)
-allowShort   = input.bool(true,  "Enable shorts",                                    group = G_DIR)
-maxTrades    = input.int(2,      "Max trades per day", minval = 1,                   group = G_DIR)
-stopAfterWin = input.bool(true,  "Stop for the day after a winning trade",           group = G_DIR)
+allowLong    = input.bool(true, "Longs",  group = G_DIR, inline = "dir")
+allowShort   = input.bool(true, "Shorts", group = G_DIR, inline = "dir")
+stopAfterWin = input.bool(true, "Stop a window after its first winner", group = G_DIR, tooltip = "Only matters when Max trades is above 1")
 
 const string G_FILT = "Filters"
-useVwap     = input.bool(true,  "Require price on correct side of RTH VWAP",         group = G_FILT)
-useEma      = input.bool(false, "Require price on correct side of EMA",              group = G_FILT)
-emaLen      = input.int(50,     "EMA length", minval = 1,                            group = G_FILT)
-atrLen      = input.int(14,     "ATR length", minval = 1,                            group = G_FILT)
-orMinAtr    = input.float(0.5,  "Min OR width (x ATR)", minval = 0.0, step = 0.1,    group = G_FILT, tooltip = "Skip the day if the opening range is too narrow (chop)")
-orMaxAtr    = input.float(4.0,  "Max OR width (x ATR)", minval = 0.1, step = 0.1,    group = G_FILT, tooltip = "Skip the day if the opening range is too wide (move already done / stop too large). ATR is measured once, when the range completes.")
+useVwap     = input.bool(true,  "Require price on correct side of RTH VWAP", group = G_FILT)
+useEma      = input.bool(false, "Require price on correct side of EMA",      group = G_FILT)
+emaLen      = input.int(50,     "EMA length", minval = 1,                    group = G_FILT)
+useVol      = input.bool(true,  "Require breakout volume",                   group = G_FILT, tooltip = "The breakout bar's volume must be at least this multiple of the average volume of the bars before it")
+volMult     = input.float(1.2,  "Min volume (x average)", minval = 0.1, step = 0.1, group = G_FILT)
+volLen      = input.int(20,     "Volume average (bars)", minval = 1,         group = G_FILT)
+atrLen      = input.int(14,     "ATR length", minval = 1,                    group = G_FILT)
 
 const string G_RISK = "Stop loss / Take profit"
-stopType    = input.string("ATR", "Stop type", options = ["ATR", "Swing"],           group = G_RISK)
-atrMult     = input.float(1.5,  "ATR stop multiplier", minval = 0.1, step = 0.1,     group = G_RISK)
-swingLen    = input.int(5,      "Swing lookback (bars)", minval = 1,                 group = G_RISK)
-swingBufTk  = input.int(4,      "Swing stop buffer (ticks)", minval = 0,             group = G_RISK)
-minStopTk   = input.int(20,     "Minimum stop distance (ticks)", minval = 1,         group = G_RISK, tooltip = "20 ticks = 5 NQ points")
-rr          = input.float(2.0,  "Risk : Reward (TP = R x stop)", minval = 0.1, step = 0.1, group = G_RISK)
-anchorFill  = input.bool(true,  "Re-anchor SL/TP to the actual fill price",          group = G_RISK, tooltip = "Orders are first placed from the signal close; once filled, SL/TP are moved so the real entry keeps the exact stop distance and R:R")
-useBE       = input.bool(false, "Move stop to breakeven",                            group = G_RISK)
+stopType    = input.string("ATR", "Stop type", options = ["ATR", "Swing"],   group = G_RISK)
+atrMult     = input.float(1.5,  "ATR stop multiplier", minval = 0.1, step = 0.1, group = G_RISK)
+swingLen    = input.int(5,      "Swing lookback (bars)", minval = 1,         group = G_RISK)
+swingBufTk  = input.int(4,      "Swing stop buffer (ticks)", minval = 0,     group = G_RISK)
+minStopTk   = input.int(20,     "Minimum stop distance (ticks)", minval = 1, group = G_RISK, tooltip = "20 ticks = 5 NQ points")
+anchorFill  = input.bool(true,  "Re-anchor SL/TP to the actual fill price",  group = G_RISK, tooltip = "Orders are first placed from the signal close; once filled, SL/TP are moved so the real entry keeps the exact stop distance and R:R")
+useBE       = input.bool(false, "Move stop to breakeven",                    group = G_RISK)
 beAtR       = input.float(1.0,  "Breakeven trigger (R in profit)", minval = 0.1, step = 0.1, group = G_RISK)
-beOffTk     = input.int(2,      "Breakeven offset (ticks)", minval = 0,              group = G_RISK, tooltip = "Stop is moved to entry + this many ticks to cover costs")
+beOffTk     = input.int(2,      "Breakeven offset (ticks)", minval = 0,      group = G_RISK, tooltip = "Stop is moved to entry + this many ticks to cover costs")
 
 const string G_VIS = "Visuals"
-colLong     = input.color(#26a69a, "Long",  inline = "col",                          group = G_VIS)
-colShort    = input.color(#ef5350, "Short", inline = "col",                          group = G_VIS)
-showOR      = input.bool(true,  "Show opening range",                                group = G_VIS)
-showZones   = input.bool(true,  "Show trade risk / reward zones",                    group = G_VIS)
-showExits   = input.bool(true,  "Show exit result labels",                           group = G_VIS)
-showVwap    = input.bool(true,  "Show RTH VWAP",                                     group = G_VIS)
-showEma     = input.bool(false, "Show EMA",                                          group = G_VIS)
+colLong      = input.color(#26a69a, "Long",     inline = "col", group = G_VIS)
+colShort     = input.color(#ef5350, "Short",    inline = "col", group = G_VIS)
+amCol        = input.color(#2962ff, "AM range", inline = "rng", group = G_VIS)
+pmCol        = input.color(#ffb300, "PM range", inline = "rng", group = G_VIS)
+showRanges   = input.bool(true,  "Show ranges",                    group = G_VIS)
+shadeEntries = input.bool(true,  "Shade entry windows",            group = G_VIS)
+showZones    = input.bool(true,  "Show trade risk / reward zones", group = G_VIS)
+showExits    = input.bool(true,  "Show exit result labels",        group = G_VIS)
+showVwap     = input.bool(true,  "Show RTH VWAP",                  group = G_VIS)
+showEma      = input.bool(false, "Show EMA",                       group = G_VIS)
 
 const string G_DASH = "Dashboard"
 showDash    = input.bool(true,  "Show dashboard",                                    group = G_DASH)
@@ -81,56 +106,127 @@ fmtP(float p)   => str.tostring(p, format.mintick)
 fmtPts(float x) => (x >= 0 ? "+" : "") + str.tostring(x, "0.00")
 fmtUsd(float x) => (x >= 0 ? "+$" : "-$") + str.tostring(math.abs(x), "#,##0")
 
-// ───────────────────────────── SESSION STATE ─────────────────────────────
-// time() returns na when the bar is outside the session string → boolean flags
-bool inRth    = not na(time(timeframe.period, rthSess,   sessTZ))
-bool inOR     = not na(time(timeframe.period, orSess,    sessTZ))
-bool inEntry  = not na(time(timeframe.period, entrySess, sessTZ))
-bool inFlat   = not na(time(timeframe.period, flatSess,  sessTZ))
-bool rthStart = inRth and not inRth[1]
-bool orStart  = inOR  and not inOR[1]
-bool orEnd    = not inOR and inOR[1]
+// Minutes after midnight → "HH:MM"
+fmtHM(int m) =>
+    int mm = (m + 1440) % 1440
+    str.tostring(math.floor(mm / 60), "00") + ":" + str.tostring(mm % 60, "00")
+
+// Session input "HHMM-HHMM" → start / end as minutes after midnight
+sessStart(string s) => int(str.tonumber(str.substring(s, 0, 2))) * 60 + int(str.tonumber(str.substring(s, 2, 4)))
+sessEnd(string s)   => int(str.tonumber(str.substring(s, 5, 7))) * 60 + int(str.tonumber(str.substring(s, 7, 9)))
+
+// Is clock time t (minutes after midnight) inside session s, [start, end)?
+inSess(int t, string s) => t >= sessStart(s) and t < sessEnd(s)
+
+// ───────────────────────────── CLOCK (Brasília) ─────────────────────────────
+const string BRT = "America/Sao_Paulo"
+const string NYT = "America/New_York"
+
+int brMin = hour(time, BRT) * 60 + minute(time, BRT)       // bar open on the Brasília clock
+int nyMin = hour(time, NYT) * 60 + minute(time, NYT)       // bar open on the New York clock
+// Clock the schedule is read against. Following NY it is "NY time + 1h", which is exactly
+// the Brasília clock while NY is on summer time, so the BRT times typed in the inputs keep
+// matching the NY session after the US changes its clocks.
+int clk   = followNY ? (nyMin + 60) % 1440 : brMin
+// Minutes to add to a typed time to get today's real Brasília clock time (dashboard text):
+// 0 while NY is on summer time, 60 while NY is on winter time
+int toBrt = followNY ? (brMin - nyMin + 1440) % 1440 - 60 : 0
+
+bool inRth      = inSess(clk, rthSess)
+bool inFlat     = inSess(clk, flatSess)
+bool amRng      = inSess(clk, amRngSess)
+bool amEnt      = inSess(clk, amEntSess)
+bool pmRng      = inSess(clk, pmRngSess)
+bool pmEnt      = inSess(clk, pmEntSess)
+bool rthStart   = inRth and not inRth[1]
+bool amRngStart = amRng and not amRng[1]
+bool amRngEnd   = not amRng and amRng[1]
+bool pmRngStart = pmRng and not pmRng[1]
+bool pmRngEnd   = not pmRng and pmRng[1]
 
 // ───────────────────────────── INDICATORS ─────────────────────────────
-float atr     = ta.atr(atrLen)
-float ema     = ta.ema(close, emaLen)
-// VWAP anchored to the 9:30 NY open (the built-in ta.vwap anchors to the 18:00 futures session open)
-float rthVwap = ta.vwap(hlc3, rthStart)
+float atr      = ta.atr(atrLen)
+float ema      = ta.ema(close, emaLen)
+// VWAP anchored to the NY open (the built-in session VWAP anchors to the 18:00 NY futures open)
+float rthVwap  = ta.vwap(hlc3, rthStart)
+// Breakout bar volume vs the average of the bars before it
+float volAvg   = ta.sma(volume, volLen)
+float volRatio = volume / volAvg[1]
+bool  volOk    = not useVol or volRatio >= volMult
 
-// ───────────────────────────── DAILY STATE + OPENING RANGE ─────────────────────────────
-var float  orHigh      = na
-var float  orLow       = na
-var float  orAtr       = na
-var bool   orValid     = false
-var string orNote      = "Waiting"
-var int    tradesToday = 0
-var bool   wonToday    = false
-var float  dayStartNet = 0.0
+// ───────────────────────────── WINDOWS (AM / PM) ─────────────────────────────
+type Win
+    string tag
+    color  col
+    bool   enabled
+    int    maxTr
+    float  rr
+    float  minAtr
+    float  maxAtr
+    float  hi     = na
+    float  lo     = na
+    float  atrRef = na
+    bool   valid  = false
+    string note   = "Waiting"
+    int    trades = 0
+    bool   won    = false
+    box    bx     = na
+    line   hiLn   = na
+    line   loLn   = na
 
+// Track the range while it forms; judge its width vs ATR once, when it completes (fixed for the day)
+method trackRange(Win w, bool rStart, bool rIn, bool rEnd, float atrPrev) =>
+    if rStart
+        w.hi    := high
+        w.lo    := low
+        w.valid := false
+        w.note  := "Building"
+    else if rIn
+        w.hi := math.max(w.hi, high)
+        w.lo := math.min(w.lo, low)
+    if rEnd and not na(w.hi)
+        float rngW = w.hi - w.lo
+        w.atrRef := atrPrev
+        w.valid  := rngW >= w.minAtr * atrPrev and rngW <= w.maxAtr * atrPrev
+        w.note   := w.valid ? "Valid" : rngW > w.maxAtr * atrPrev ? "Too wide" : "Too narrow"
+    w
+
+// Draw the range box while it forms, then project its high / low through the entry window
+method drawRange(Win w, bool rStart, bool rIn, bool rEnd, bool eIn) =>
+    if rStart
+        w.bx := box.new(bar_index, high, bar_index, low, border_color = color.new(w.col, 50), bgcolor = color.new(w.col, 88), text = w.tag + " range", text_color = color.new(w.col, 10), text_size = size.small, text_halign = text.align_left, text_valign = text.align_top)
+    else if rIn and not na(w.bx)
+        box.set_top(w.bx,    w.hi)
+        box.set_bottom(w.bx, w.lo)
+        box.set_right(w.bx,  bar_index)
+    if rEnd and not na(w.bx)
+        // Grey out the range on skipped days
+        color rc = w.valid ? w.col : color.gray
+        box.set_bgcolor(w.bx,      color.new(rc, 88))
+        box.set_border_color(w.bx, color.new(rc, 50))
+        box.set_text_color(w.bx,   color.new(rc, 10))
+        box.set_text(w.bx, w.valid ? w.tag + " range" : w.tag + " · " + str.lower(w.note))
+        w.hiLn := line.new(bar_index - 1, w.hi, bar_index, w.hi, color = color.new(w.valid ? colLong  : color.gray, 30), style = line.style_dotted)
+        w.loLn := line.new(bar_index - 1, w.lo, bar_index, w.lo, color = color.new(w.valid ? colShort : color.gray, 30), style = line.style_dotted)
+    else if eIn and not na(w.hiLn)
+        line.set_x2(w.hiLn, bar_index)
+        line.set_x2(w.loLn, bar_index)
+    w
+
+var Win   amW         = Win.new("AM", amCol, amOn, amMax, amRR, amMinAtr, amMaxAtr)
+var Win   pmW         = Win.new("PM", pmCol, pmOn, pmMax, pmRR, pmMinAtr, pmMaxAtr)
+var float dayStartNet = 0.0
+
+// New NY session: reset the day's counters
 if rthStart
-    tradesToday := 0
-    wonToday    := false
     dayStartNet := strategy.netprofit
+    amW.trades  := 0
+    amW.won     := false
+    pmW.trades  := 0
+    pmW.won     := false
 
-if orStart
-    orHigh  := high
-    orLow   := low
-    orValid := false
-    orNote  := "Building"
-else if inOR
-    orHigh := math.max(orHigh, high)
-    orLow  := math.min(orLow,  low)
-
-float orWidth = orHigh - orLow
-
-// Judge the range once, when it completes, using the ATR of the last OR bar (stays fixed all day)
-if orEnd and not na(orHigh)
-    orAtr   := atr[1]
-    orValid := orWidth >= orMinAtr * orAtr and orWidth <= orMaxAtr * orAtr
-    orNote  := orValid ? "Valid" : orWidth > orMaxAtr * orAtr ? "Too wide" : "Too narrow"
-
-bool orReady = inRth and not inOR and not na(orHigh)
-bool orOk    = orReady and orValid
+amW.trackRange(amRngStart, amRng, amRngEnd, atr[1])
+pmW.trackRange(pmRngStart, pmRng, pmRngEnd, atr[1])
 
 // ───────────────────────────── STOP DISTANCE ─────────────────────────────
 float tick    = syminfo.mintick
@@ -149,8 +245,10 @@ var float tradeEntry = na
 var float tradeSL    = na
 var float tradeTP    = na
 var float tradeRisk  = na
+var float tradeRR    = na
 var int   tradeDir   = 0
 var bool  beDone     = false
+var Win   tradeW     = na          // window the current / last trade came from
 
 var box   riskBox    = na
 var box   rewardBox  = na
@@ -180,7 +278,7 @@ if newTrade and not na(tradeRisk)
 
     if anchorFill
         tradeSL := math.round_to_mintick(tradeEntry - tradeDir * tradeRisk)
-        tradeTP := math.round_to_mintick(tradeEntry + tradeDir * tradeRisk * rr)
+        tradeTP := math.round_to_mintick(tradeEntry + tradeDir * tradeRisk * tradeRR)
         if inPos
             if tradeDir > 0
                 strategy.exit("Long Exit",  from_entry = "Long",  stop = tradeSL, limit = tradeTP, comment_loss = "SL", comment_profit = "TP")
@@ -193,9 +291,9 @@ if newTrade and not na(tradeRisk)
         slLine    := line.new(bar_index, tradeSL,    bar_index, tradeSL,    color = colShort, width = 2)
         tpLine    := line.new(bar_index, tradeTP,    bar_index, tradeTP,    color = colLong,  width = 2)
         enLine    := line.new(bar_index, tradeEntry, bar_index, tradeEntry, color = color.new(color.gray, 20), style = line.style_dashed)
-        slLbl     := label.new(bar_index, tradeSL,    "SL  " + fmtP(tradeSL),    style = label.style_label_left, color = colShort, textcolor = color.white, size = size.small)
-        tpLbl     := label.new(bar_index, tradeTP,    "TP  " + fmtP(tradeTP),    style = label.style_label_left, color = colLong,  textcolor = color.white, size = size.small)
-        enLbl     := label.new(bar_index, tradeEntry, (tradeDir > 0 ? "LONG  " : "SHORT  ") + fmtP(tradeEntry), style = label.style_label_left, color = color.new(color.gray, 10), textcolor = color.white, size = size.small)
+        slLbl     := label.new(bar_index, tradeSL,    "SL  " + fmtP(tradeSL), style = label.style_label_left, color = colShort, textcolor = color.white, size = size.small)
+        tpLbl     := label.new(bar_index, tradeTP,    "TP  " + fmtP(tradeTP), style = label.style_label_left, color = colLong,  textcolor = color.white, size = size.small)
+        enLbl     := label.new(bar_index, tradeEntry, tradeW.tag + (tradeDir > 0 ? " LONG  " : " SHORT  ") + fmtP(tradeEntry), style = label.style_label_left, color = color.new(color.gray, 10), textcolor = color.white, size = size.small)
 
 // ── Breakeven: once price has moved beAtR x risk in our favour, pull the stop to entry ──
 if useBE and inPos and not beDone and not na(tradeRisk)
@@ -223,8 +321,11 @@ if tradeClosed
     float  pts    = (exitPx - strategy.closedtrades.entry_price(ci)) * (strategy.closedtrades.size(ci) > 0 ? 1 : -1)
     string why    = strategy.closedtrades.exit_comment(ci)
     why := why == "" ? "Exit" : why
-    if pnl > 0
-        wonToday := true
+    string tg     = ""
+    if not na(tradeW)
+        tg := tradeW.tag + " "
+        if pnl > 0
+            tradeW.won := true
 
     if not na(riskBox)
         box.set_right(riskBox,   bar_index)
@@ -246,50 +347,68 @@ if tradeClosed
     enLbl     := na
 
     if showExits
-        label.new(bar_index, exitPx, why + "  " + fmtPts(pts), style = label.style_label_left, color = pnl >= 0 ? colLong : colShort, textcolor = color.white, size = size.small, tooltip = "Exit " + fmtP(exitPx) + "\nP&L " + fmtUsd(pnl))
-    alert(syminfo.ticker + " ORB: trade closed (" + why + ") at " + fmtP(exitPx) + " | " + fmtPts(pts) + " pts | " + fmtUsd(pnl), alert.freq_once_per_bar_close)
+        label.new(bar_index, exitPx, why + "  " + fmtPts(pts), style = label.style_label_left, color = pnl >= 0 ? colLong : colShort, textcolor = color.white, size = size.small, tooltip = tg + "exit " + fmtP(exitPx) + "\nP&L " + fmtUsd(pnl))
+    alert(syminfo.ticker + " " + tg + "trade closed (" + why + ") at " + fmtP(exitPx) + " | " + fmtPts(pts) + " pts | " + fmtUsd(pnl), alert.freq_once_per_bar_close)
 
 // ───────────────────────────── SIGNALS (confirmed bars only) ─────────────────────────────
-bool dayDone  = tradesToday >= maxTrades or (stopAfterWin and wonToday)
-bool canTrade = barstate.isconfirmed and inEntry and orOk and not inPos and not dayDone
+// Window whose entry period is open on this bar (entry periods don't overlap)
+Win act = na
+if amEnt and amW.enabled
+    act := amW
+else if pmEnt and pmW.enabled
+    act := pmW
 
-// First close beyond the OR (close[1] was still inside / at the level)
-bool longBreak  = close > orHigh and close[1] <= orHigh
-bool shortBreak = close < orLow  and close[1] >= orLow
+float actHi = na
+float actLo = na
+bool  actOk = false
+if not na(act)
+    actHi := act.hi
+    actLo := act.lo
+    actOk := act.valid and act.trades < act.maxTr and not (stopAfterWin and act.won)
+
+bool canTrade = barstate.isconfirmed and actOk and not inPos
+
+// First close beyond the range (close[1] was still inside / at the level)
+bool longBreak  = close > actHi and close[1] <= actHi
+bool shortBreak = close < actLo and close[1] >= actLo
 
 bool longFilt  = (not useVwap or close > rthVwap) and (not useEma or close > ema)
 bool shortFilt = (not useVwap or close < rthVwap) and (not useEma or close < ema)
 
-bool longSignal  = canTrade and allowLong  and longBreak  and longFilt
-bool shortSignal = canTrade and allowShort and shortBreak and shortFilt
+bool longSignal  = canTrade and allowLong  and longBreak  and longFilt  and volOk
+bool shortSignal = canTrade and allowShort and shortBreak and shortFilt and volOk
 
 // ───────────────────────────── ORDERS ─────────────────────────────
 if longSignal
+    tradeW     := act
+    tradeRR    := act.rr
     tradeRisk  := longRisk
     tradeEntry := close
     tradeSL    := math.round_to_mintick(close - longRisk)
-    tradeTP    := math.round_to_mintick(close + longRisk * rr)
-    tradesToday += 1
-    strategy.entry("Long", strategy.long)
+    tradeTP    := math.round_to_mintick(close + longRisk * tradeRR)
+    act.trades := act.trades + 1
+    strategy.entry("Long", strategy.long, comment = act.tag + " Long")
     strategy.exit("Long Exit", from_entry = "Long", stop = tradeSL, limit = tradeTP, comment_loss = "SL", comment_profit = "TP")
-    label.new(bar_index, low, "▲ LONG", yloc = yloc.belowbar, style = label.style_label_up, color = colLong, textcolor = color.white, size = size.small, tooltip = "Signal close " + fmtP(close) + "\nSL " + fmtP(tradeSL) + "\nTP " + fmtP(tradeTP))
-    alert(syminfo.ticker + " ORB LONG | Entry ≈ " + fmtP(close) + " | SL " + fmtP(tradeSL) + " (-" + str.tostring(longRisk, "0.00") + " pts) | TP " + fmtP(tradeTP) + " (+" + str.tostring(longRisk * rr, "0.00") + " pts)", alert.freq_once_per_bar_close)
+    label.new(bar_index, low, "▲ " + act.tag + " LONG", yloc = yloc.belowbar, style = label.style_label_up, color = colLong, textcolor = color.white, size = size.small, tooltip = "Signal close " + fmtP(close) + "\nSL " + fmtP(tradeSL) + "\nTP " + fmtP(tradeTP) + "\nVolume " + str.tostring(volRatio, "0.00") + "x avg")
+    alert(syminfo.ticker + " " + act.tag + " LONG | Entry ≈ " + fmtP(close) + " | SL " + fmtP(tradeSL) + " (-" + str.tostring(longRisk, "0.00") + " pts) | TP " + fmtP(tradeTP) + " (+" + str.tostring(longRisk * tradeRR, "0.00") + " pts)", alert.freq_once_per_bar_close)
 
 if shortSignal
+    tradeW     := act
+    tradeRR    := act.rr
     tradeRisk  := shortRisk
     tradeEntry := close
     tradeSL    := math.round_to_mintick(close + shortRisk)
-    tradeTP    := math.round_to_mintick(close - shortRisk * rr)
-    tradesToday += 1
-    strategy.entry("Short", strategy.short)
+    tradeTP    := math.round_to_mintick(close - shortRisk * tradeRR)
+    act.trades := act.trades + 1
+    strategy.entry("Short", strategy.short, comment = act.tag + " Short")
     strategy.exit("Short Exit", from_entry = "Short", stop = tradeSL, limit = tradeTP, comment_loss = "SL", comment_profit = "TP")
-    label.new(bar_index, high, "▼ SHORT", yloc = yloc.abovebar, style = label.style_label_down, color = colShort, textcolor = color.white, size = size.small, tooltip = "Signal close " + fmtP(close) + "\nSL " + fmtP(tradeSL) + "\nTP " + fmtP(tradeTP))
-    alert(syminfo.ticker + " ORB SHORT | Entry ≈ " + fmtP(close) + " | SL " + fmtP(tradeSL) + " (+" + str.tostring(shortRisk, "0.00") + " pts) | TP " + fmtP(tradeTP) + " (-" + str.tostring(shortRisk * rr, "0.00") + " pts)", alert.freq_once_per_bar_close)
+    label.new(bar_index, high, "▼ " + act.tag + " SHORT", yloc = yloc.abovebar, style = label.style_label_down, color = colShort, textcolor = color.white, size = size.small, tooltip = "Signal close " + fmtP(close) + "\nSL " + fmtP(tradeSL) + "\nTP " + fmtP(tradeTP) + "\nVolume " + str.tostring(volRatio, "0.00") + "x avg")
+    alert(syminfo.ticker + " " + act.tag + " SHORT | Entry ≈ " + fmtP(close) + " | SL " + fmtP(tradeSL) + " (+" + str.tostring(shortRisk, "0.00") + " pts) | TP " + fmtP(tradeTP) + " (-" + str.tostring(shortRisk * tradeRR, "0.00") + " pts)", alert.freq_once_per_bar_close)
 
-// End-of-day flatten: inside the flatten window, or (safety net) if we somehow hold outside RTH
+// End-of-day flatten: inside the flatten window, or (safety net) if we somehow hold outside NY hours
 if inPos and (inFlat or not inRth)
     strategy.close_all(comment = "EOD")
-    alert(syminfo.ticker + " ORB: flattening open position before session close", alert.freq_once_per_bar_close)
+    alert(syminfo.ticker + " ORB: flattening open position before the NY close", alert.freq_once_per_bar_close)
 
 // ───────────────────────────── CHART: LIVE TRADE ZONES ─────────────────────────────
 // Stretch the zones, lines and price tags to the current bar while the trade is open
@@ -303,33 +422,20 @@ if inPos and not na(slLine)
     label.set_x(tpLbl, bar_index)
     label.set_x(enLbl, bar_index)
 
-// ───────────────────────────── CHART: OPENING RANGE ─────────────────────────────
-var box  orBox  = na
-var line orHiLn = na
-var line orLoLn = na
+// ───────────────────────────── CHART: RANGES + CONTEXT ─────────────────────────────
+if showRanges and amW.enabled
+    amW.drawRange(amRngStart, amRng, amRngEnd, amEnt)
+if showRanges and pmW.enabled
+    pmW.drawRange(pmRngStart, pmRng, pmRngEnd, pmEnt)
 
-if showOR
-    if orStart
-        orBox := box.new(bar_index, high, bar_index, low, border_color = color.new(color.blue, 50), bgcolor = color.new(color.blue, 88), text = "OR", text_color = color.new(color.blue, 20), text_size = size.small, text_halign = text.align_left, text_valign = text.align_top)
-    else if inOR and not na(orBox)
-        box.set_top(orBox,    orHigh)
-        box.set_bottom(orBox, orLow)
-        box.set_right(orBox,  bar_index)
+color shade = na
+if shadeEntries
+    if amEnt and amW.enabled
+        shade := color.new(amW.col, 94)
+    else if pmEnt and pmW.enabled
+        shade := color.new(pmW.col, 94)
+bgcolor(shade, title = "Entry windows")
 
-    if orEnd and not na(orBox)
-        // Grey out the range on skipped days, then project its high / low across the session
-        color orCol = orValid ? color.blue : color.gray
-        box.set_bgcolor(orBox,     color.new(orCol, 88))
-        box.set_border_color(orBox, color.new(orCol, 50))
-        box.set_text_color(orBox,   color.new(orCol, 20))
-        box.set_text(orBox, orValid ? "OR" : "OR · " + str.lower(orNote))
-        orHiLn := line.new(bar_index - 1, orHigh, bar_index, orHigh, color = color.new(orValid ? colLong  : color.gray, 30), style = line.style_dotted)
-        orLoLn := line.new(bar_index - 1, orLow,  bar_index, orLow,  color = color.new(orValid ? colShort : color.gray, 30), style = line.style_dotted)
-    else if orReady and not na(orHiLn)
-        line.set_x2(orHiLn, bar_index)
-        line.set_x2(orLoLn, bar_index)
-
-// ───────────────────────────── CHART: CONTEXT ─────────────────────────────
 plot(showVwap and inRth ? rthVwap : na, "RTH VWAP", color = color.new(color.purple, 0), style = plot.style_linebr, linewidth = 2)
 plot(showEma ? ema : na, "EMA", color = color.new(color.yellow, 0))
 
@@ -350,12 +456,36 @@ color C_KEY_TX  = color.rgb(209, 212, 220)
 color C_NEUTRAL = color.rgb(178, 181, 190)
 color C_WARN    = color.rgb(255, 152, 0)
 color C_INFO    = color.rgb(0, 188, 212)
+color C_BUILD   = color.rgb(255, 235, 59)
 
-var table dash = table.new(dashPos, 2, 6, frame_color = color.rgb(70, 74, 85), frame_width = 1, border_color = color.rgb(70, 74, 85), border_width = 1)
+var table dash = table.new(dashPos, 2, 8, frame_color = color.rgb(70, 74, 85), frame_width = 1, border_color = color.rgb(70, 74, 85), border_width = 1)
 
 dashRow(int row, string key, string val, color valCol) =>
     table.cell(dash, 0, row, key, text_color = C_KEY_TX, bgcolor = C_KEY_BG, text_halign = text.align_left, text_size = dashSize)
     table.cell(dash, 1, row, val, text_color = valCol,   bgcolor = C_VAL_BG, text_halign = text.align_left, text_size = dashSize)
+
+// A time typed in the inputs → today's Brasília clock time
+brtHM(int m) => fmtHM(m + toBrt)
+
+// One row per window: its schedule before it starts, the live range while it forms, the verdict after
+winStatus(Win w, string rngSess, bool rIn, bool eIn) =>
+    string txt = "Off"
+    color  tc  = C_NEUTRAL
+    if w.enabled
+        if clk < sessStart(rngSess)
+            txt := "Range " + brtHM(sessStart(rngSess)) + "–" + brtHM(sessEnd(rngSess))
+        else if rIn
+            txt := "Building  " + str.tostring(w.hi - w.lo, "0.00") + " pts"
+            tc  := C_BUILD
+        else if na(w.atrRef) or na(w.hi)
+            txt := "No range"
+        else if not w.valid
+            txt := "Skipped: " + str.lower(w.note)
+            tc  := C_WARN
+        else
+            txt := str.tostring(w.hi - w.lo, "0.00") + " pts  " + str.tostring((w.hi - w.lo) / w.atrRef, "0.0") + "x ATR ✓"
+            tc  := eIn ? C_INFO : colLong
+    [txt, tc]
 
 if showDash and barstate.islast
     // Trend: which side the filters currently allow
@@ -372,62 +502,70 @@ if showDash and barstate.islast
             trendTxt := "Mixed: stand aside"
             trendCol := C_WARN
 
-    // Trade: live position or what the strategy is waiting for
-    string tradeTxt = "No new entries"
+    // Trade: live position, or what the strategy is waiting for
+    string tradeTxt = "No more entries today"
     color  tradeCol = C_NEUTRAL
     if inPos
         float openPts = (close - strategy.position_avg_price) * tradeDir
-        tradeTxt := (tradeDir > 0 ? "Long @ " : "Short @ ") + fmtP(strategy.position_avg_price) + "  " + fmtPts(openPts) + " pts"
+        tradeTxt := tradeW.tag + (tradeDir > 0 ? " Long @ " : " Short @ ") + fmtP(strategy.position_avg_price) + "  " + fmtPts(openPts) + " pts"
         tradeCol := openPts >= 0 ? colLong : colShort
     else if not inRth
-        tradeTxt := "Waiting for open"
-    else if inOR
-        tradeTxt := "Building range"
-        tradeCol := color.yellow
-    else if na(orHigh) or na(orAtr)
-        tradeTxt := "No range yet"
-    else if not orValid
-        tradeTxt := "Skipped: range " + str.lower(orNote)
-        tradeCol := C_WARN
-    else if stopAfterWin and wonToday
-        tradeTxt := "Done: winner banked"
-        tradeCol := colLong
-    else if tradesToday >= maxTrades
-        tradeTxt := "Done: max trades"
-    else if inEntry
-        tradeTxt := "Watching breakout"
-        tradeCol := C_INFO
+        tradeTxt := "Waiting for the NY open"
+    else if not na(act)
+        if not act.valid
+            tradeTxt := na(act.atrRef) ? "No " + act.tag + " range" : act.tag + " skipped: range " + str.lower(act.note)
+            tradeCol := C_WARN
+        else if stopAfterWin and act.won
+            tradeTxt := act.tag + " done: winner banked"
+            tradeCol := colLong
+        else if act.trades >= act.maxTr
+            tradeTxt := act.tag + " done: max trades"
+        else
+            tradeTxt := "Watching " + act.tag + " breakout"
+            tradeCol := C_INFO
+    else if (amRng and amW.enabled) or (pmRng and pmW.enabled)
+        tradeTxt := "Building " + (amRng ? "AM" : "PM") + " range"
+        tradeCol := C_BUILD
+    else if pmW.enabled and clk < sessStart(pmEntSess)
+        tradeTxt := "Next: PM entries at " + brtHM(sessStart(pmEntSess))
 
     // Today: trade count and day P&L (closed + open)
-    float dayPnl   = strategy.netprofit - dayStartNet + strategy.openprofit
-    string todayTxt = str.tostring(tradesToday) + " of " + str.tostring(maxTrades) + " trades  " + fmtUsd(dayPnl)
+    int    maxToday = (amW.enabled ? amW.maxTr : 0) + (pmW.enabled ? pmW.maxTr : 0)
+    float  dayPnl   = strategy.netprofit - dayStartNet + strategy.openprofit
+    string todayTxt = str.tostring(amW.trades + pmW.trades) + " of " + str.tostring(maxToday) + " trades  " + fmtUsd(dayPnl)
     color  todayCol = dayPnl > 0 ? colLong : dayPnl < 0 ? colShort : C_NEUTRAL
 
-    // Hours: where we are in the NY session
-    string hoursTxt = "Closed"
+    // Hours: where we are in the NY session, shown on the Brasília clock
+    string hoursTxt = "Closed · NY open " + brtHM(sessStart(rthSess)) + " BRT"
     color  hoursCol = C_NEUTRAL
-    if inOR
-        hoursTxt := "Opening range"
-        hoursCol := color.yellow
-    else if inFlat
-        hoursTxt := "Flattening"
+    if inFlat
+        hoursTxt := "Flattening before the close"
         hoursCol := C_WARN
-    else if inEntry
-        hoursTxt := "Open"
+    else if amRng
+        hoursTxt := "AM range until " + brtHM(sessEnd(amRngSess)) + " BRT"
+        hoursCol := C_BUILD
+    else if amEnt
+        hoursTxt := "AM entries until " + brtHM(sessEnd(amEntSess)) + " BRT"
+        hoursCol := colLong
+    else if pmRng
+        hoursTxt := "Lunch range until " + brtHM(sessEnd(pmRngSess)) + " BRT"
+        hoursCol := C_BUILD
+    else if pmEnt
+        hoursTxt := "PM entries until " + brtHM(sessEnd(pmEntSess)) + " BRT"
         hoursCol := colLong
     else if inRth
-        hoursTxt := "Open, no entries"
+        hoursTxt := "Open · NY close " + brtHM(sessEnd(rthSess)) + " BRT"
 
-    // Range: opening-range width vs ATR and whether it passed the filter
-    string rangeTxt = "—"
-    color  rangeCol = C_NEUTRAL
-    if not na(orHigh)
-        if inOR
-            rangeTxt := "Building  " + str.tostring(orWidth, "0.00") + " pts"
-            rangeCol := color.yellow
-        else if not na(orAtr)
-            rangeTxt := str.tostring(orWidth, "0.00") + " pts  " + str.tostring(orWidth / orAtr, "0.0") + "x ATR  " + (orValid ? "✓" : "✗")
-            rangeCol := orValid ? colLong : C_WARN
+    // AM / PM: each window's range
+    [amTxt, amTc] = winStatus(amW, amRngSess, amRng, amEnt)
+    [pmTxt, pmTc] = winStatus(pmW, pmRngSess, pmRng, pmEnt)
+
+    // Volume: last bar vs the average of the bars before it
+    string volTxt = "—"
+    color  volCol = C_NEUTRAL
+    if not na(volRatio)
+        volTxt := str.tostring(volRatio, "0.00") + "x avg" + (useVol ? (volRatio >= volMult ? "  ✓" : "  ✗") : "")
+        volCol := volRatio >= volMult ? colLong : C_NEUTRAL
 
     // Chart: timeframe / symbol sanity check
     bool   tfOk     = timeframe.isminutes and timeframe.multiplier == 5
@@ -436,9 +574,11 @@ if showDash and barstate.islast
     string chartTxt = tfTxt + (tfOk ? " OK" : ", use 5m") + (symOk ? "" : ", not NQ")
     color  chartCol = tfOk and symOk ? colLong : C_WARN
 
-    dashRow(0, "Trend", trendTxt, trendCol)
-    dashRow(1, "Trade", tradeTxt, tradeCol)
-    dashRow(2, "Today", todayTxt, todayCol)
-    dashRow(3, "Hours", hoursTxt, hoursCol)
-    dashRow(4, "Range", rangeTxt, rangeCol)
-    dashRow(5, "Chart", chartTxt, chartCol)
+    dashRow(0, "Trend",  trendTxt, trendCol)
+    dashRow(1, "Trade",  tradeTxt, tradeCol)
+    dashRow(2, "Today",  todayTxt, todayCol)
+    dashRow(3, "Hours",  hoursTxt, hoursCol)
+    dashRow(4, "AM",     amTxt,    amTc)
+    dashRow(5, "PM",     pmTxt,    pmTc)
+    dashRow(6, "Volume", volTxt,   volCol)
+    dashRow(7, "Chart",  chartTxt, chartCol)
