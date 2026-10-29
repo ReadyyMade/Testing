@@ -14,6 +14,7 @@
 //  Filters: RTH VWAP side, optional EMA, range width vs ATR, breakout volume.
 //  Stop = ATR or swing, target = per-window R:R re-anchored to the real fill,
 //  optional breakeven, flat before the close, one position at a time.
+//  Marks the previous day high / low (PDH / PDL) and overnight high / low (ONH / ONL).
 // =============================================================================
 strategy(title                   = "NQ AM/PM Range Breakout (BRT)",
          shorttitle              = "NQ AM/PM",
@@ -96,6 +97,17 @@ showExits    = input.bool(true,  "Show exit result labels",        group = G_VIS
 showVwap     = input.bool(true,  "Show RTH VWAP",                  group = G_VIS)
 showEma      = input.bool(false, "Show EMA",                       group = G_VIS)
 
+const string G_LVL   = "Key levels"
+const string PD_RTH  = "NY session (09:30–16:00 NY)"
+const string PD_FULL = "Full futures day (18:00–17:00 NY)"
+showPD   = input.bool(true, "Previous day high / low (PDH / PDL)", group = G_LVL, inline = "pd")
+pdCol    = input.color(#e040fb, "", group = G_LVL, inline = "pd")
+pdMode   = input.string(PD_RTH, "Previous day from", options = [PD_RTH, PD_FULL], group = G_LVL, tooltip = "NY session: high / low of the previous 09:30–16:00 NY session. Full futures day: high / low from the 18:00 NY Globex open the evening before to the 17:00 NY halt, overnight included.")
+showON   = input.bool(true, "Overnight high / low (ONH / ONL)", group = G_LVL, inline = "on")
+onCol    = input.color(#00bcd4, "", group = G_LVL, inline = "on")
+onSess   = input.session("1900-1030", "Overnight session", group = G_LVL, tooltip = "18:00–09:30 New York (the Globex overnight). Typed in Brasília time like the schedule, and it follows New York daylight saving the same way.")
+keepPast = input.bool(false, "Keep past days' levels on the chart", group = G_LVL)
+
 const string G_DASH = "Dashboard"
 showDash    = input.bool(true,  "Show dashboard",                                    group = G_DASH)
 dashPosIn   = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = G_DASH)
@@ -115,8 +127,11 @@ fmtHM(int m) =>
 sessStart(string s) => int(str.tonumber(str.substring(s, 0, 2))) * 60 + int(str.tonumber(str.substring(s, 2, 4)))
 sessEnd(string s)   => int(str.tonumber(str.substring(s, 5, 7))) * 60 + int(str.tonumber(str.substring(s, 7, 9)))
 
-// Is clock time t (minutes after midnight) inside session s, [start, end)?
-inSess(int t, string s) => t >= sessStart(s) and t < sessEnd(s)
+// Is clock time t (minutes after midnight) inside session s, [start, end)? Handles sessions past midnight.
+inSess(int t, string s) =>
+    int a = sessStart(s)
+    int b = sessEnd(s)
+    a <= b ? t >= a and t < b : t >= a or t < b
 
 // ───────────────────────────── CLOCK (Brasília) ─────────────────────────────
 const string BRT = "America/Sao_Paulo"
@@ -439,6 +454,111 @@ bgcolor(shade, title = "Entry windows")
 plot(showVwap and inRth ? rthVwap : na, "RTH VWAP", color = color.new(color.purple, 0), style = plot.style_linebr, linewidth = 2)
 plot(showEma ? ema : na, "EMA", color = color.new(color.yellow, 0))
 
+// ───────────────────────────── KEY LEVELS: PDH / PDL / ONH / ONL ─────────────────────────────
+// High / low tracker that remembers which bar made each extreme (level lines start at that candle)
+type HiLo
+    float hi    = na
+    float lo    = na
+    int   hiBar = na
+    int   loBar = na
+
+method restart(HiLo r) =>
+    r.hi    := high
+    r.lo    := low
+    r.hiBar := bar_index
+    r.loBar := bar_index
+    r
+
+method addBar(HiLo r) =>
+    if na(r.hi) or high > r.hi
+        r.hi    := high
+        r.hiBar := bar_index
+    if na(r.lo) or low < r.lo
+        r.lo    := low
+        r.loBar := bar_index
+    r
+
+bool inON    = inSess(clk, onSess)
+bool onStart = inON and not inON[1]      // Globex reopens: a new futures day and a new overnight begin
+bool rthEnd  = not inRth and inRth[1]    // the NY session just ended
+
+var HiLo rthHL = HiLo.new()              // current NY session
+var HiLo dayHL = HiLo.new()              // current futures day, from the Globex open
+var HiLo onHL  = HiLo.new()              // current overnight session
+var HiLo pdHL  = HiLo.new()              // previous day, per the selected mode
+bool pdNew = false
+
+if onStart
+    if pdMode == PD_FULL and not na(dayHL.hi)
+        pdHL  := dayHL.copy()
+        pdNew := true
+    dayHL.restart()
+    onHL.restart()
+else
+    dayHL.addBar()
+    if inON
+        onHL.addBar()
+
+if rthStart
+    rthHL.restart()
+else if inRth
+    rthHL.addBar()
+
+if rthEnd and pdMode == PD_RTH and not na(rthHL.hi)
+    pdHL  := rthHL.copy()
+    pdNew := true
+
+var line  pdhLn  = na
+var line  pdlLn  = na
+var line  onhLn  = na
+var line  onlLn  = na
+var label pdhLbl = na
+var label pdlLbl = na
+var label onhLbl = na
+var label onlLbl = na
+
+// New level line from the candle that made it; the previous one is deleted unless past days are kept
+newLevel(line old, int x1, float y, color c) =>
+    if not keepPast
+        line.delete(old)
+    line.new(x1, y, bar_index, y, color = c, style = line.style_dashed)
+
+// One price tag per level, kept just above the right end of its current line
+tagLevel(label lb, string name, float y, color c) =>
+    label res = lb
+    if na(lb)
+        res := label.new(bar_index, y, name + "  " + fmtP(y), style = label.style_label_lower_left, color = color.new(c, 100), textcolor = c, size = size.small)
+    else
+        label.set_xy(lb, bar_index, y)
+        label.set_text(lb, name + "  " + fmtP(y))
+    res
+
+if showPD and not na(pdHL.hi)
+    if pdNew or na(pdhLn)
+        pdhLn := newLevel(pdhLn, pdHL.hiBar, pdHL.hi, pdCol)
+        pdlLn := newLevel(pdlLn, pdHL.loBar, pdHL.lo, pdCol)
+    line.set_x2(pdhLn, bar_index)
+    line.set_x2(pdlLn, bar_index)
+    pdhLbl := tagLevel(pdhLbl, "PDH", pdHL.hi, pdCol)
+    pdlLbl := tagLevel(pdlLbl, "PDL", pdHL.lo, pdCol)
+
+if showON and not na(onHL.hi)
+    if onStart or na(onhLn)
+        onhLn := newLevel(onhLn, onHL.hiBar, onHL.hi, onCol)
+        onlLn := newLevel(onlLn, onHL.loBar, onHL.lo, onCol)
+    else if inON
+        // Overnight still forming: keep the lines on the latest high / low
+        line.set_xy1(onhLn, onHL.hiBar, onHL.hi)
+        line.set_y2(onhLn,  onHL.hi)
+        line.set_xy1(onlLn, onHL.loBar, onHL.lo)
+        line.set_y2(onlLn,  onHL.lo)
+    // Overnight levels matter through the NY session; they stop extending at the close
+    if inON or inRth
+        line.set_x2(onhLn, bar_index)
+        line.set_x2(onlLn, bar_index)
+        onhLbl := tagLevel(onhLbl, "ONH", onHL.hi, onCol)
+        onlLbl := tagLevel(onlLbl, "ONL", onHL.lo, onCol)
+
 // ───────────────────────────── DASHBOARD ─────────────────────────────
 string dashPos = switch dashPosIn
     "Top Left"     => position.top_left
@@ -458,7 +578,7 @@ color C_WARN    = color.rgb(255, 152, 0)
 color C_INFO    = color.rgb(0, 188, 212)
 color C_BUILD   = color.rgb(255, 235, 59)
 
-var table dash = table.new(dashPos, 2, 8, frame_color = color.rgb(70, 74, 85), frame_width = 1, border_color = color.rgb(70, 74, 85), border_width = 1)
+var table dash = table.new(dashPos, 2, 9, frame_color = color.rgb(70, 74, 85), frame_width = 1, border_color = color.rgb(70, 74, 85), border_width = 1)
 
 dashRow(int row, string key, string val, color valCol) =>
     table.cell(dash, 0, row, key, text_color = C_KEY_TX, bgcolor = C_KEY_BG, text_halign = text.align_left, text_size = dashSize)
@@ -560,6 +680,29 @@ if showDash and barstate.islast
     [amTxt, amTc] = winStatus(amW, amRngSess, amRng, amEnt)
     [pmTxt, pmTc] = winStatus(pmW, pmRngSess, pmRng, pmEnt)
 
+    // Levels: nearest key level above and below the last close
+    string lvlTxt = showPD or showON ? "—" : "Off"
+    color  lvlCol = C_NEUTRAL
+    float  upD    = na
+    float  dnD    = na
+    string upN    = ""
+    string dnN    = ""
+    array<float>  lvlPx = array.from(showPD ? pdHL.hi : na, showPD ? pdHL.lo : na, showON ? onHL.hi : na, showON ? onHL.lo : na)
+    array<string> lvlNm = array.from("PDH", "PDL", "ONH", "ONL")
+    for i = 0 to 3
+        float lp = array.get(lvlPx, i)
+        if not na(lp)
+            float dist = lp - close
+            if dist >= 0 and (na(upD) or dist < upD)
+                upD := dist
+                upN := array.get(lvlNm, i)
+            else if dist < 0 and (na(dnD) or dist > dnD)
+                dnD := dist
+                dnN := array.get(lvlNm, i)
+    if not na(upD) or not na(dnD)
+        lvlTxt := (na(upD) ? "" : "↑ " + upN + " " + fmtPts(upD)) + (not na(upD) and not na(dnD) ? "   " : "") + (na(dnD) ? "" : "↓ " + dnN + " " + fmtPts(dnD))
+        lvlCol := color.white
+
     // Volume: last bar vs the average of the bars before it
     string volTxt = "—"
     color  volCol = C_NEUTRAL
@@ -580,5 +723,6 @@ if showDash and barstate.islast
     dashRow(3, "Hours",  hoursTxt, hoursCol)
     dashRow(4, "AM",     amTxt,    amTc)
     dashRow(5, "PM",     pmTxt,    pmTc)
-    dashRow(6, "Volume", volTxt,   volCol)
-    dashRow(7, "Chart",  chartTxt, chartCol)
+    dashRow(6, "Levels", lvlTxt,   lvlCol)
+    dashRow(7, "Volume", volTxt,   volCol)
+    dashRow(8, "Chart",  chartTxt, chartCol)
